@@ -8,16 +8,16 @@ export function PendulumStage({ engine }: { engine: Experiment }) {
   useEffect(() => {
     const canvas = canvasRef.current; if (!canvas) return;
     const ctx = canvas.getContext('2d'); if (!ctx) return;
-    let width = 700, height = 400, raf = 0;
-    const observer = new ResizeObserver(entries => { const box = entries[0].contentRect; width = box.width; height = box.height; const dpr = Math.min(window.devicePixelRatio || 1, 2); canvas.width = width * dpr; canvas.height = height * dpr; ctx.setTransform(dpr, 0, 0, dpr, 0, 0); });
+    let width = 700, height = 400, raf = 0, grid = new Path2D();
+    const observer = new ResizeObserver(entries => { const box = entries[0].contentRect; width = box.width; height = box.height; const dpr = Math.min(window.devicePixelRatio || 1, 2); canvas.width = width * dpr; canvas.height = height * dpr; ctx.setTransform(dpr, 0, 0, dpr, 0, 0); grid = new Path2D(); for (let gx = 18; gx < width; gx += 22) for (let gy = 14; gy < height; gy += 22) { grid.moveTo(gx + .65, gy); grid.arc(gx, gy, .65, 0, Math.PI * 2); } });
     observer.observe(canvas);
     const draw = () => {
       ctx.clearRect(0, 0, width, height);
-      const p = parameters(engine.config.topology), s = engine.state;
+      const p = parameters(engine.config.topology), s = engine.displayState();
       const scale = Math.min((width - 90) / 6, 105), center = width / 2, py = height * .53;
       const x = center + s[0] * scale;
       ctx.fillStyle = '#dae1d3';
-      for (let gx = 18; gx < width; gx += 22) for (let gy = 14; gy < height; gy += 22) { ctx.beginPath(); ctx.arc(gx, gy, .65, 0, Math.PI * 2); ctx.fill(); }
+      ctx.fill(grid);
       const line = (x1: number, y1: number, x2: number, y2: number, color: string, weight = 1) => { ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.strokeStyle = color; ctx.lineWidth = weight; ctx.stroke(); };
       const circle = (cx: number, cy: number, radius: number, fill: string, stroke?: string) => { ctx.beginPath(); ctx.arc(cx, cy, radius, 0, Math.PI * 2); ctx.fillStyle = fill; ctx.fill(); if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = 2; ctx.stroke(); } };
       ctx.font = '10px monospace'; ctx.textAlign = 'center';

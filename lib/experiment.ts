@@ -1,4 +1,4 @@
-import { DT, finishReason, initialState, isBalanced, parameters, type State, type Task, type Topology, step } from './physics.ts';
+import { DT, clamp, finishReason, initialState, isBalanced, parameters, type State, type Task, type Topology, step } from './physics.ts';
 import { ARCHITECTURES, requestBody, validJevAnswer, type Architecture, type JevAnswer, type LayerDecision, type Memory, type Observation } from './jev.ts';
 import { localControl, type LocalControl } from './local-controller.ts';
 
@@ -11,7 +11,7 @@ export interface Recording { version: 1; createdAt: string; config: Config; fram
 export class Experiment {
   config: Config;
   state: State;
-  time = 0; wall = 0; force = 0; running = false; pending = false;
+  time = 0; wall = 0; force = 0; frameRate = 0; running = false; pending = false;
   balance = 0; bestBalance = 0; reason = ''; error = ''; decisions: Decision[] = []; frames: Frame[] = [];
   events: Recording['events'] = [];
   manual = 0;
@@ -27,7 +27,18 @@ export class Experiment {
     this.frames.push(this.frame());
   }
   subscribe(listener: () => void) { this.listeners.add(listener); return () => { this.listeners.delete(listener); }; }
-  private notify(force = false) { if (force || performance.now() - this.lastNotify > 45) { this.lastNotify = performance.now(); this.listeners.forEach(fn => fn()); } }
+  // Canvas reads physical state on its own animation loop. React telemetry needs only 10 Hz.
+  private notify(force = false, now = performance.now()) { if (force || now - this.lastNotify >= 100) { this.lastNotify = now; this.listeners.forEach(fn => fn()); } }
+  private get synchronousControl() { return this.config.controller !== 'jev' && this.config.delay === 0; }
+  /** Render interpolation only: one fixed step behind, no predicted/corrected physics. */
+  displayState(): State {
+    if (!this.running || (!this.replay && this.config.clock === 'wait' && !this.synchronousControl)) return this.state;
+    const index = this.replay ? this.replayIndex : this.frames.length - 1;
+    if (index < 1) return this.state;
+    const before = this.frames[index - 1].state, current = this.frames[index].state;
+    const alpha = clamp(this.accumulator / DT, 0, 1);
+    return current.map((value, i) => before[i] + (value - before[i]) * alpha);
+  }
   frame(): Frame { return { time: this.time, state: [...this.state], force: this.force, balance: this.balance, wall: this.wall }; }
   private cancel() { this.epoch++; this.abort?.abort(); this.abort = null; this.pending = false; }
   pause() { this.running = false; this.cancel(); cancelAnimationFrame(this.raf); this.accumulator = 0; this.notify(true); }
@@ -36,7 +47,7 @@ export class Experiment {
   reset(config = this.config) {
     this.pause(); this.config = { ...config }; this.p = parameters(config.topology);
     this.state = initialState(config.topology, config.task, config.seed); this.randomSeed = config.seed;
-    this.time = this.wall = this.force = this.balance = this.bestBalance = 0;
+    this.time = this.wall = this.force = this.balance = this.bestBalance = this.frameRate = 0;
     this.error = this.reason = ''; this.frames = [this.frame()]; this.decisions = []; this.events = []; this.replay = null; this.replayIndex = 0; this.manual = 0; this.lastRequest = -Infinity; this.notify(true);
   }
   start() { if (this.running || this.pending || this.reason) return; this.error = ''; this.running = true; this.lastFrame = performance.now(); this.raf = requestAnimationFrame(this.tick); this.notify(true); }
@@ -44,20 +55,25 @@ export class Experiment {
     if (!this.running) return;
     const elapsed = (now - this.lastFrame) / 1000; this.lastFrame = now; this.wall += elapsed;
     if (elapsed > .5) { this.error = '화면 처리 지연으로 일시정지했습니다. 재개해 주세요.'; this.pause(); return; }
+    if (elapsed > 0) this.frameRate = this.frameRate ? this.frameRate * .9 + .1 / elapsed : 1 / elapsed;
     if (this.replay) {
       this.accumulator += elapsed;
-      while (this.accumulator >= DT && this.replayIndex < this.replay.frames.length - 1) { this.accumulator -= DT; this.seek(this.replayIndex + 1, false); }
+      while (this.accumulator + 1e-9 >= DT && this.replayIndex < this.replay.frames.length - 1) { this.accumulator -= DT; this.seek(this.replayIndex + 1, false); }
       if (this.replayIndex >= this.replay.frames.length - 1) { this.pause(); return; }
+    } else if (this.synchronousControl) {
+      // Preserve fractional frame time and catch up with fixed 20ms physics steps.
+      // Each step gets its own fresh force, independent of display refresh rate.
+      this.accumulator += elapsed;
+      while (this.accumulator + 1e-9 >= DT && this.running) { this.accumulator -= DT; void this.decide(true); }
     } else if (this.config.clock === 'wait') {
       this.accumulator = Math.min(this.accumulator + elapsed, DT);
       if (this.accumulator >= DT && !this.pending && this.requestReady(now)) { this.accumulator = 0; void this.decide(true); }
     } else {
-      const synchronousLocal = this.config.controller === 'local' && this.config.delay === 0;
-      if (!synchronousLocal && !this.pending && this.requestReady(now)) void this.decide(false);
+      if (!this.pending && this.requestReady(now)) void this.decide(false);
       this.accumulator += elapsed;
-      while (this.accumulator + 1e-9 >= DT && this.running) { if (synchronousLocal) void this.decide(false); this.advance(); this.accumulator -= DT; }
+      while (this.accumulator + 1e-9 >= DT && this.running) { this.accumulator -= DT; this.advance(); }
     }
-    this.notify();
+    this.notify(false, now);
     if (this.running) this.raf = requestAnimationFrame(this.tick);
   };
   private requestReady(now: number) { return now - this.lastRequest >= (this.config.controller === 'jev' ? (this.config.architecture === 'single' ? 100 : 200) : 19); }
@@ -76,7 +92,7 @@ export class Experiment {
   private async decide(advance: boolean) {
     this.pending = true; const epoch = this.epoch, started = performance.now(); this.lastRequest = started;
     const observedAt = this.time, observation = [...this.state]; this.abort = new AbortController(); const signal = this.abort.signal;
-    this.notify(true);
+    if (!this.synchronousControl) this.notify(true);
     try {
       let force = 0, phase = '', model = '', answer: JevAnswer | undefined, local: LocalControl | undefined;
       if (this.config.controller === 'jev') {
@@ -102,7 +118,7 @@ export class Experiment {
       this.decisions.push({ id: this.decisions.length + 1, observedAt, appliedAt: this.time, observation, force, action: force > .001 ? 'RIGHT' : force < -.001 ? 'LEFT' : 'HOLD', model, latency: performance.now() - started, phase, ...(local ? { local } : {}), ...(answer ? { probabilities: answer.probabilities, confidence: answer.confidence, serverLatencyMs: answer.serverLatencyMs, layers: answer.layers, calls: answer.calls, nodeCount: answer.nodeCount, inputTokens: answer.inputTokens, outputTokens: answer.outputTokens } : { calls: 0, inputTokens: 0, outputTokens: 0 }) });
       if (advance) this.advance();
     } catch (error) { if (epoch === this.epoch) { this.error = error instanceof Error ? error.message : '제어 요청에 실패했습니다.'; this.pause(); } }
-    finally { if (epoch === this.epoch) { this.pending = false; this.abort = null; this.notify(true); } }
+    finally { if (epoch === this.epoch) { this.pending = false; this.abort = null; if (!this.running || !this.synchronousControl) this.notify(true); } }
   }
   private advance() {
     this.state = step(this.state, this.force, this.p); this.time = Math.round((this.time + DT) * 100000) / 100000;
