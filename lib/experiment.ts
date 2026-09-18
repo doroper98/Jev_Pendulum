@@ -1,10 +1,11 @@
 import { DT, finishReason, initialState, isBalanced, parameters, type State, type Task, type Topology, step } from './physics.ts';
 import { ARCHITECTURES, requestBody, validJevAnswer, type Architecture, type JevAnswer, type LayerDecision, type Memory, type Observation } from './jev.ts';
+import { localControl, type LocalControl } from './local-controller.ts';
 
-export type Controller = 'jev' | 'manual' | 'random';
+export type Controller = 'jev' | 'local' | 'manual' | 'random';
 export interface Config { topology: Topology; task: Task; controller: Controller; architecture: Architecture; clock: 'wait' | 'realtime'; force: number; delay: number; duration: number; seed: number; representation: 'numeric' | 'described'; }
 export const DEFAULT_CONFIG: Config = { topology: 'single', task: 'swingup', controller: 'jev', architecture: 'single', clock: 'wait', force: 10, delay: 0, duration: 30, seed: 42, representation: 'numeric' };
-export interface Decision { id: number; observedAt: number; appliedAt: number; observation: State; force: number; action: string; model: string; latency: number; phase: string; probabilities?: { LEFT: number; RIGHT: number }; confidence?: number; serverLatencyMs?: number; layers?: LayerDecision[]; calls?: number; nodeCount?: number; inputTokens?: number | null; outputTokens?: number | null; }
+export interface Decision { id: number; observedAt: number; appliedAt: number; observation: State; force: number; action: string; model: string; latency: number; phase: string; local?: LocalControl; probabilities?: { LEFT: number; RIGHT: number }; confidence?: number; serverLatencyMs?: number; layers?: LayerDecision[]; calls?: number; nodeCount?: number; inputTokens?: number | null; outputTokens?: number | null; }
 export interface Frame { time: number; state: State; force: number; balance: number; wall: number; }
 export interface Recording { version: 1; createdAt: string; config: Config; frames: Frame[]; decisions: Decision[]; events: { time: number; type: string }[]; }
 export class Experiment {
@@ -30,6 +31,8 @@ export class Experiment {
   frame(): Frame { return { time: this.time, state: [...this.state], force: this.force, balance: this.balance, wall: this.wall }; }
   private cancel() { this.epoch++; this.abort?.abort(); this.abort = null; this.pending = false; }
   pause() { this.running = false; this.cancel(); cancelAnimationFrame(this.raf); this.accumulator = 0; this.notify(true); }
+  stop() { this.pause(); this.manual = 0; }
+  restart() { if (this.replay) this.seek(0); else this.reset(); this.start(); }
   reset(config = this.config) {
     this.pause(); this.config = { ...config }; this.p = parameters(config.topology);
     this.state = initialState(config.topology, config.task, config.seed); this.randomSeed = config.seed;
@@ -49,9 +52,10 @@ export class Experiment {
       this.accumulator = Math.min(this.accumulator + elapsed, DT);
       if (this.accumulator >= DT && !this.pending && this.requestReady(now)) { this.accumulator = 0; void this.decide(true); }
     } else {
-      if (!this.pending && this.requestReady(now)) void this.decide(false);
+      const synchronousLocal = this.config.controller === 'local' && this.config.delay === 0;
+      if (!synchronousLocal && !this.pending && this.requestReady(now)) void this.decide(false);
       this.accumulator += elapsed;
-      while (this.accumulator + 1e-9 >= DT && this.running) { this.advance(); this.accumulator -= DT; }
+      while (this.accumulator + 1e-9 >= DT && this.running) { if (synchronousLocal) void this.decide(false); this.advance(); this.accumulator -= DT; }
     }
     this.notify();
     if (this.running) this.raf = requestAnimationFrame(this.tick);
@@ -74,7 +78,7 @@ export class Experiment {
     const observedAt = this.time, observation = [...this.state]; this.abort = new AbortController(); const signal = this.abort.signal;
     this.notify(true);
     try {
-      let force = 0, phase = '', model = '', answer: JevAnswer | undefined;
+      let force = 0, phase = '', model = '', answer: JevAnswer | undefined, local: LocalControl | undefined;
       if (this.config.controller === 'jev') {
         const body: Observation = { topology: this.config.topology, task: this.config.task, state: observation, time: observedAt, force: this.config.force, representation: this.config.representation, architecture: this.config.architecture, history: this.memory() };
         const response = await fetch('/api/jev', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal });
@@ -82,6 +86,9 @@ export class Experiment {
         if (!response.ok) { const error = data && typeof data === 'object' && 'error' in data ? data.error : null; throw new Error(typeof error === 'string' ? error : 'Jev 요청이 실패했습니다.'); }
         if (!validJevAnswer(data)) throw new Error('유효하지 않은 제어 응답입니다.');
         answer = data; force = answer.action === 'RIGHT' ? this.config.force : -this.config.force; model = answer.model; phase = 'Jev Choice';
+      } else if (this.config.controller === 'local') {
+        local = localControl(this.config.topology, this.config.task, observation, observedAt, this.config.force);
+        force = local.force; phase = local.phase; model = 'local-tvlqr-v1';
       } else if (this.config.controller === 'random') {
         this.randomSeed = (Math.imul(this.randomSeed, 1664525) + 1013904223) >>> 0;
         force = this.randomSeed / 4294967296 < .5 ? -this.config.force : this.config.force; model = 'seeded-random-v1'; phase = '시드 고정 무작위';
@@ -92,7 +99,7 @@ export class Experiment {
       });
       if (epoch !== this.epoch) return;
       this.force = force;
-      this.decisions.push({ id: this.decisions.length + 1, observedAt, appliedAt: this.time, observation, force, action: force > .001 ? 'RIGHT' : force < -.001 ? 'LEFT' : 'HOLD', model, latency: performance.now() - started, phase, ...(answer ? { probabilities: answer.probabilities, confidence: answer.confidence, serverLatencyMs: answer.serverLatencyMs, layers: answer.layers, calls: answer.calls, nodeCount: answer.nodeCount, inputTokens: answer.inputTokens, outputTokens: answer.outputTokens } : {}) });
+      this.decisions.push({ id: this.decisions.length + 1, observedAt, appliedAt: this.time, observation, force, action: force > .001 ? 'RIGHT' : force < -.001 ? 'LEFT' : 'HOLD', model, latency: performance.now() - started, phase, ...(local ? { local } : {}), ...(answer ? { probabilities: answer.probabilities, confidence: answer.confidence, serverLatencyMs: answer.serverLatencyMs, layers: answer.layers, calls: answer.calls, nodeCount: answer.nodeCount, inputTokens: answer.inputTokens, outputTokens: answer.outputTokens } : { calls: 0, inputTokens: 0, outputTokens: 0 }) });
       if (advance) this.advance();
     } catch (error) { if (epoch === this.epoch) { this.error = error instanceof Error ? error.message : '제어 요청에 실패했습니다.'; this.pause(); } }
     finally { if (epoch === this.epoch) { this.pending = false; this.abort = null; this.notify(true); } }
@@ -125,11 +132,12 @@ export class Experiment {
 export function parseRecording(text: string): Recording {
   if (text.length > 15000000) throw new Error('15MB 이하의 실험 파일을 선택하세요.');
   const r = JSON.parse(text) as Recording, c = r?.config;
-  if (r?.version !== 1 || !c || !['single', 'double'].includes(c.topology) || !['balance', 'swingup'].includes(c.task) || !['jev', 'random', 'manual'].includes(c.controller) || !Object.hasOwn(ARCHITECTURES, c.architecture) || !['wait', 'realtime'].includes(c.clock) || !['numeric', 'described'].includes(c.representation) || !Number.isInteger(c.seed) || !Number.isFinite(c.force) || c.force < 2 || c.force > 20 || !Number.isFinite(c.delay) || c.delay < 0 || c.delay > 1000 || !Number.isFinite(c.duration) || c.duration < 1 || c.duration > 120) throw new Error('지원하지 않는 실험 파일입니다.');
+  if (r?.version !== 1 || !c || !['single', 'double'].includes(c.topology) || !['balance', 'swingup'].includes(c.task) || !['jev', 'local', 'random', 'manual'].includes(c.controller) || !Object.hasOwn(ARCHITECTURES, c.architecture) || !['wait', 'realtime'].includes(c.clock) || !['numeric', 'described'].includes(c.representation) || !Number.isInteger(c.seed) || !Number.isFinite(c.force) || c.force < 2 || c.force > 20 || !Number.isFinite(c.delay) || c.delay < 0 || c.delay > 1000 || !Number.isFinite(c.duration) || c.duration < 1 || c.duration > 120) throw new Error('지원하지 않는 실험 파일입니다.');
   const n = c.topology === 'single' ? 4 : 6;
   if (!Array.isArray(r.frames) || !r.frames.length || r.frames.length > 6100 || r.frames.some((f, i) => !Array.isArray(f.state) || f.state.length !== n || !f.state.every(Number.isFinite) || ![f.time, f.force, f.balance, f.wall].every(Number.isFinite) || f.time < 0 || (i > 0 && f.time < r.frames[i - 1].time))) throw new Error('유효하지 않은 상태 기록입니다.');
   if (!Array.isArray(r.decisions) || r.decisions.length > 10000 || r.decisions.some(d => !d || typeof d.model !== 'string' || typeof d.phase !== 'string' || !['LEFT', 'RIGHT', 'HOLD'].includes(d.action) || ![d.id, d.observedAt, d.appliedAt, d.force, d.latency].every(Number.isFinite) || !Array.isArray(d.observation) || d.observation.length !== n || !d.observation.every(Number.isFinite) || (d.probabilities !== undefined && (!Number.isFinite(d.probabilities?.LEFT) || !Number.isFinite(d.probabilities?.RIGHT))))) throw new Error('유효하지 않은 판단 기록입니다.');
   if (r.decisions.some(d => d.layers && !validJevAnswer({ ...d, action: d.action, calls: d.calls, nodeCount: d.nodeCount }))) throw new Error('유효하지 않은 네트워크 판단입니다.');
+  if (r.decisions.some(d => d.local && (!Array.isArray(d.local.reference) || d.local.reference.length !== n || !d.local.reference.every(Number.isFinite) || ![d.local.force, d.local.feedforward, d.local.feedback].every(Number.isFinite) || typeof d.local.saturated !== 'boolean' || typeof d.local.phase !== 'string'))) throw new Error('유효하지 않은 로컬 제어 기록입니다.');
   if (!Array.isArray(r.events)) r.events = [];
   return r;
 }
