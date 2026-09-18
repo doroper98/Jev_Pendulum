@@ -98,5 +98,11 @@ export async function evaluateNetwork(o: Observation, model: string, send: (requ
 export function validJevAnswer(value: unknown): value is JevAnswer {
   if (!value || typeof value !== 'object') return false;
   const a = value as JevAnswer;
-  return (a.action === 'LEFT' || a.action === 'RIGHT') && typeof a.model === 'string' && Number.isFinite(a.confidence) && Number.isFinite(a.probabilities?.LEFT) && Number.isFinite(a.probabilities?.RIGHT) && Array.isArray(a.layers) && a.layers.length >= 1 && a.layers.length <= 3 && a.layers.every(l => typeof l.name === 'string' && Number.isFinite(l.latencyMs) && Array.isArray(l.nodes) && l.nodes.every(n => typeof n.id === 'string' && typeof n.choice === 'string' && typeof n.label === 'string' && Number.isFinite(n.confidence))) && Number.isFinite(a.calls) && Number.isFinite(a.nodeCount);
+  const probability = (n: unknown): n is number => typeof n === 'number' && Number.isFinite(n) && n >= 0 && n <= 1;
+  const distribution = (v: unknown, selected: string) => {
+    if (!v || typeof v !== 'object' || Array.isArray(v)) return false;
+    const p = v as Record<string, unknown>, values = Object.values(p);
+    return Object.hasOwn(p, selected) && values.length >= 2 && values.length <= 10 && values.every(probability) && Math.abs((values as number[]).reduce((sum, n) => sum + n, 0) - 1) < .02;
+  };
+  return (a.action === 'LEFT' || a.action === 'RIGHT') && typeof a.model === 'string' && probability(a.confidence) && distribution(a.probabilities, a.action) && probability(a.probabilities?.LEFT) && probability(a.probabilities?.RIGHT) && Array.isArray(a.layers) && a.layers.length >= 1 && a.layers.length <= 3 && a.layers.every(l => l && typeof l.name === 'string' && Number.isFinite(l.latencyMs) && Array.isArray(l.nodes) && l.nodes.length >= 1 && l.nodes.length <= 3 && l.nodes.every(n => n && typeof n.id === 'string' && typeof n.choice === 'string' && typeof n.label === 'string' && probability(n.confidence) && distribution(n.probabilities, n.choice))) && Number.isInteger(a.calls) && a.calls >= 1 && a.calls <= 3 && Number.isInteger(a.nodeCount) && a.nodeCount >= 1 && a.nodeCount <= 6;
 }

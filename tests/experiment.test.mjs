@@ -26,7 +26,7 @@ test('reset discards late API reply with no leaked force or decision', async () 
   globalThis.fetch = () => new Promise(r => { resolve = r; });
   const pending = e.singleStep(); e.reset(); const resetState = [...e.state];
   resolve(Response.json(providerAnswer)); await pending;
-  assert.equal(e.time, 0); assert.equal(e.force, 0); assert.equal(e.decisions.length, 0); assert.deepEqual(e.state, resetState); e.dispose();
+  assert.equal(e.time, 0); assert.equal(e.wall, 0); assert.equal(e.force, 0); assert.equal(e.decisions.length, 0); assert.deepEqual(e.state, resetState); e.dispose();
 });
 test('realtime clock keeps previous force while a network response is pending', async () => {
   const e = new Experiment({ ...DEFAULT_CONFIG, clock: 'realtime' }); let resolve;

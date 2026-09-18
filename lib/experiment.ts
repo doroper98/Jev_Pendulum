@@ -62,7 +62,10 @@ export class Experiment {
     if (this.replay) { this.seek(Math.min(this.replayIndex + 1, this.replay.frames.length - 1)); return; }
     if (!this.requestReady(performance.now())) return;
     this.error = '';
-    const start = performance.now(); await this.decide(true); this.wall += (performance.now() - start) / 1000;
+    const start = performance.now(), activeFrames = this.frames;
+    await this.decide(true);
+    if (activeFrames !== this.frames) return;
+    this.wall += (performance.now() - start) / 1000;
     if (this.frames.at(-1)?.time === this.time) this.frames[this.frames.length - 1].wall = this.wall;
     this.notify(true);
   }
