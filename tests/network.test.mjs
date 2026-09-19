@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { ARCHITECTURES, evaluateNetwork, parseNodes, physicalState, validObservation } from '../lib/jev.ts';
+import { ARCHITECTURES, evaluateNetwork, parseNodes, physicalState, validObservation, validJevAnswer } from '../lib/jev.ts';
 
 const observation = { topology: 'double', task: 'swingup', state: [0, 3.1, 3.2, 0, .1, -.1], time: .02, force: 10, representation: 'numeric', architecture: 'single' };
 function response(request) {
@@ -33,4 +33,11 @@ test('input validation and no embedded control policy', () => {
   assert.equal(validObservation(observation), true);
   for (const patch of [{ architecture: 'unknown' }, { state: [0, 0] }, { force: Infinity }, { time: -1 }, { history: Array(4).fill({}) }]) assert.equal(validObservation({ ...observation, ...patch }), false);
   assert.equal(JSON.stringify(physicalState(observation)).includes('recommendedAction'), false);
+});
+test('recorded network distributions must be present and normalized', async () => {
+  const answer = await evaluateNetwork(observation, 'jev-latest', async request => response(request));
+  assert.equal(validJevAnswer(answer), true);
+  const malformed = structuredClone(answer); delete malformed.layers[0].nodes[0].probabilities;
+  assert.equal(validJevAnswer(malformed), false);
+  answer.confidence = 3; assert.equal(validJevAnswer(answer), false);
 });

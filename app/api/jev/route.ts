@@ -1,10 +1,12 @@
-import { evaluateNetwork, validObservation } from '@/lib/jev';
+import { evaluateNetwork, validObservation } from '../../../lib/jev.ts';
+import { addUsage, emptyUsage, reportedUsage } from '../../../lib/usage.ts';
 
 const headers = { 'Cache-Control': 'no-store' };
 export async function GET() {
   return Response.json({ configured: Boolean(process.env.TYPESAFE_API_KEY), model: process.env.JEV_MODEL || 'jev-latest' }, { headers });
 }
 export async function POST(request: Request) {
+  const usage = emptyUsage();
   // Same-origin browser calls only. No arbitrary proxy destination or prompt.
   const origin = request.headers.get('origin');
   if (origin && origin !== new URL(request.url).origin) return Response.json({ error: '허용되지 않은 요청 출처입니다.' }, { status: 403, headers });
@@ -22,6 +24,8 @@ export async function POST(request: Request) {
     if (!validObservation(body)) return Response.json({ error: '물리 상태와 실험 설정을 확인하세요.' }, { status: 400, headers });
     const signal = AbortSignal.any([request.signal, AbortSignal.timeout(18000)]);
     const answer = await evaluateNetwork(body, process.env.JEV_MODEL || 'jev-latest', async evaluation => {
+    // Reserve an unknown call before sending; retain it on timeout/error.
+    usage.calls++; usage.unreportedCalls++;
     const response = await fetch('https://api.typesafe.ai/v1/systemone', {
       method: 'POST', headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
       body: JSON.stringify(evaluation),
@@ -38,13 +42,16 @@ export async function POST(request: Request) {
     let payload = '', bytes = 0; const utf8 = new TextDecoder();
     for (;;) { const part = await upstream.read(); if (part.done) break; bytes += part.value.byteLength; if (bytes > 65536) { await upstream.cancel(); throw new Error('large response'); } payload += utf8.decode(part.value, { stream: true }); }
     payload += utf8.decode();
-    return JSON.parse(payload);
+    const data: unknown = JSON.parse(payload);
+    usage.calls--; usage.unreportedCalls--;
+    addUsage(usage, reportedUsage(data));
+    return data;
     });
-    return Response.json(answer, { headers });
+    return Response.json({ ...answer, usage }, { headers });
   } catch (error) {
-    if (error instanceof ProviderError) return Response.json({ error: error.message }, { status: error.status, headers });
+    if (error instanceof ProviderError) return Response.json({ error: error.message, usage }, { status: error.status, headers });
     const timeout = error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError');
-    return Response.json({ error: timeout ? 'Jev 응답 대기 시간이 초과되었습니다. 실험을 일시정지했습니다.' : 'Jev 연결 또는 응답 검증에 실패했습니다. 실험을 일시정지했습니다.' }, { status: timeout ? 504 : 502, headers });
+    return Response.json({ error: timeout ? 'Jev 응답 대기 시간이 초과되었습니다. 실험을 일시정지했습니다.' : 'Jev 연결 또는 응답 검증에 실패했습니다. 실험을 일시정지했습니다.', usage }, { status: timeout ? 504 : 502, headers });
   }
 }
 

@@ -5,21 +5,23 @@ import { degrees, parameters } from '@/lib/physics';
 
 export function PendulumStage({ engine }: { engine: Experiment }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const drag = useRef<{ pointer: number; offset: number } | null>(null);
   useEffect(() => {
     const canvas = canvasRef.current; if (!canvas) return;
     const ctx = canvas.getContext('2d'); if (!ctx) return;
-    let width = 700, height = 400, raf = 0;
-    const observer = new ResizeObserver(entries => { const box = entries[0].contentRect; width = box.width; height = box.height; const dpr = Math.min(window.devicePixelRatio || 1, 2); canvas.width = width * dpr; canvas.height = height * dpr; ctx.setTransform(dpr, 0, 0, dpr, 0, 0); });
+    let width = 700, height = 400, raf = 0, grid = new Path2D();
+    const observer = new ResizeObserver(entries => { const box = entries[0].contentRect; width = box.width; height = box.height; const dpr = Math.min(window.devicePixelRatio || 1, 2); canvas.width = width * dpr; canvas.height = height * dpr; ctx.setTransform(dpr, 0, 0, dpr, 0, 0); grid = new Path2D(); for (let gx = 18; gx < width; gx += 22) for (let gy = 14; gy < height; gy += 22) { grid.moveTo(gx + .65, gy); grid.arc(gx, gy, .65, 0, Math.PI * 2); } });
     observer.observe(canvas);
     const draw = () => {
       ctx.clearRect(0, 0, width, height);
-      const p = parameters(engine.config.topology), s = engine.state;
+      const p = parameters(engine.config.topology), s = engine.displayState();
       const scale = Math.min((width - 90) / 6, 105), center = width / 2, py = height * .53;
       const x = center + s[0] * scale;
       ctx.fillStyle = '#dae1d3';
-      for (let gx = 18; gx < width; gx += 22) for (let gy = 14; gy < height; gy += 22) { ctx.beginPath(); ctx.arc(gx, gy, .65, 0, Math.PI * 2); ctx.fill(); }
+      ctx.fill(grid);
       const line = (x1: number, y1: number, x2: number, y2: number, color: string, weight = 1) => { ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.strokeStyle = color; ctx.lineWidth = weight; ctx.stroke(); };
       const circle = (cx: number, cy: number, radius: number, fill: string, stroke?: string) => { ctx.beginPath(); ctx.arc(cx, cy, radius, 0, Math.PI * 2); ctx.fillStyle = fill; ctx.fill(); if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = 2; ctx.stroke(); } };
+      if (engine.dragTarget !== null) { const target = center + engine.dragTarget * scale; ctx.setLineDash([3, 4]); line(x, py + 8, target, py + 8, '#c66b34', 2); ctx.setLineDash([]); circle(target, py + 8, 5, '#fff4e8', '#c66b34'); }
       ctx.font = '10px monospace'; ctx.textAlign = 'center';
       ctx.setLineDash([4, 5]); line(center, 42, center, height - 46, '#d0dac6'); ctx.setLineDash([]);
       const railY = py + 27;
@@ -48,10 +50,11 @@ export function PendulumStage({ engine }: { engine: Experiment }) {
         ctx.font = '11px monospace'; ctx.fillStyle = '#486043'; ctx.textAlign = 'left'; ctx.fillText(`θ${i + 1} ${degrees(s[i + 1]).toFixed(1)}°`, ex + 19, ey + 4);
         px = ex; ay = ey;
       });
-      if (Math.abs(engine.force) > .01) {
-        const sign = Math.sign(engine.force), ax = x + sign * 44, end = ax + sign * Math.min(62, 14 + Math.abs(engine.force) * 3), yy = py + 8;
+      const totalForce = engine.force + engine.disturbanceForce;
+      if (Math.abs(totalForce) > .01) {
+        const sign = Math.sign(totalForce), ax = x + sign * 44, end = ax + sign * Math.min(62, 14 + Math.abs(totalForce) * 3), yy = py + 8;
         line(ax, yy, end, yy, '#c68a44', 2); line(end, yy, end - sign * 6, yy - 4, '#c68a44', 2); line(end, yy, end - sign * 6, yy + 4, '#c68a44', 2);
-        ctx.textAlign = 'center'; ctx.font = '10px monospace'; ctx.fillStyle = '#ad7a40'; ctx.fillText(`${engine.force.toFixed(1)} N`, (ax + end) / 2, yy - 13);
+        ctx.textAlign = 'center'; ctx.font = '10px monospace'; ctx.fillStyle = '#ad7a40'; ctx.fillText(`${totalForce.toFixed(1)} N`, (ax + end) / 2, yy - 13);
       }
       ctx.textAlign = 'left'; ctx.font = '10px monospace'; ctx.fillStyle = '#8c9782'; ctx.fillText('x →  /  θ : vertical up = 0°', 23, height - 21);
       ctx.textAlign = 'right'; ctx.fillText('g  9.81 m/s²', width - 23, height - 21);
@@ -59,5 +62,20 @@ export function PendulumStage({ engine }: { engine: Experiment }) {
     };
     draw(); return () => { observer.disconnect(); cancelAnimationFrame(raf); };
   }, [engine]);
-  return <canvas ref={canvasRef} className="pendulum-canvas" aria-label="수레와 역진자의 현재 물리 상태. 아래 계측값에서 위치와 각도를 읽을 수 있습니다." role="img" />;
+  const release = () => { if (drag.current) { drag.current = null; engine.releaseCart(); } };
+  return <canvas ref={canvasRef} className="pendulum-canvas interactive-cart" aria-label="실행 중 수레를 좌우로 드래그해 힘을 가할 수 있습니다. 아래 수레 밀기 버튼으로도 조작할 수 있습니다." role="img"
+    onPointerDown={event => {
+      if (event.button !== 0 || !engine.running || engine.replay) return;
+      const rect = event.currentTarget.getBoundingClientRect(), scale = Math.min((rect.width - 90) / 6, 105);
+      const px = event.clientX - rect.left, py = event.clientY - rect.top, cart = rect.width / 2 + engine.displayState()[0] * scale;
+      if (Math.abs(px - cart) > 43 || Math.abs(py - rect.height * .53 - 10) > 29) return;
+      event.preventDefault(); event.currentTarget.setPointerCapture(event.pointerId);
+      const coordinate = (px - rect.width / 2) / scale;
+      drag.current = { pointer: event.pointerId, offset: coordinate - engine.state[0] }; engine.dragCart(engine.state[0]);
+    }}
+    onPointerMove={event => {
+      if (drag.current?.pointer !== event.pointerId) return;
+      const rect = event.currentTarget.getBoundingClientRect(), scale = Math.min((rect.width - 90) / 6, 105);
+      engine.dragCart((event.clientX - rect.left - rect.width / 2) / scale - drag.current.offset);
+    }} onPointerUp={release} onPointerCancel={release} onLostPointerCapture={release} />;
 }
