@@ -1,19 +1,21 @@
 import { DT, clamp, finishReason, initialState, isBalanced, massMatrix, parameters, solve, type State, type Task, type Topology, step } from './physics.ts';
 import { ARCHITECTURES, requestBody, validJevAnswer, type Architecture, type JevAnswer, type LayerDecision, type Memory, type Observation } from './jev.ts';
 import { LocalController, type LocalControl } from './local-controller.ts';
+import { addUsage, emptyUsage, usageFromDecisions, validUsage, type UsageTotals } from './usage.ts';
 
 export type Controller = 'jev' | 'local' | 'manual' | 'random';
 export interface Config { topology: Topology; task: Task; controller: Controller; architecture: Architecture; clock: 'wait' | 'realtime'; force: number; delay: number; duration: number; seed: number; representation: 'numeric' | 'described'; }
 export const DEFAULT_CONFIG: Config = { topology: 'single', task: 'swingup', controller: 'jev', architecture: 'single', clock: 'wait', force: 10, delay: 0, duration: 30, seed: 42, representation: 'numeric' };
 export interface Decision { id: number; observedAt: number; appliedAt: number; observation: State; force: number; action: string; model: string; latency: number; phase: string; local?: LocalControl; probabilities?: { LEFT: number; RIGHT: number }; confidence?: number; serverLatencyMs?: number; layers?: LayerDecision[]; calls?: number; nodeCount?: number; inputTokens?: number | null; outputTokens?: number | null; }
 export interface Frame { time: number; state: State; force: number; balance: number; wall: number; controlForce?: number; disturbanceForce?: number; }
-export interface Recording { version: 1; createdAt: string; config: Config; frames: Frame[]; decisions: Decision[]; events: { time: number; type: string }[]; }
+export interface Recording { version: 1; createdAt: string; config: Config; frames: Frame[]; decisions: Decision[]; events: { time: number; type: string }[]; usage?: UsageTotals; }
 export class Experiment {
   config: Config;
   state: State;
   time = 0; wall = 0; force = 0; frameRate = 0; running = false; pending = false;
   balance = 0; bestBalance = 0; reason = ''; error = ''; decisions: Decision[] = []; frames: Frame[] = [];
   events: Recording['events'] = [];
+  usage = emptyUsage(); sessionUsage = emptyUsage();
   manual = 0;
   pushForce = 0; dragTarget: number | null = null; disturbanceForce = 0;
   replay: Recording | null = null;
@@ -50,6 +52,7 @@ export class Experiment {
     this.pause(); this.local?.dispose(); this.local = null; this.config = { ...config }; this.p = parameters(config.topology);
     this.state = initialState(config.topology, config.task, config.seed); this.randomSeed = config.seed;
     this.time = this.wall = this.force = this.balance = this.bestBalance = this.frameRate = this.disturbanceForce = 0;
+    this.usage = emptyUsage();
     this.error = this.reason = ''; this.frames = [this.frame()]; this.decisions = []; this.events = []; this.replay = null; this.replayIndex = 0; this.manual = 0; this.lastRequest = -Infinity; this.notify(true);
   }
   private async prepareLocal() {
@@ -107,9 +110,20 @@ export class Experiment {
     try {
       let force = 0, phase = '', model = '', answer: JevAnswer | undefined, local: LocalControl | undefined;
       if (this.config.controller === 'jev') {
+        // Keep the run reference: late receipts still count in the page total,
+        // but never become charges for a newly reset experiment.
+        const runUsage = this.usage;
+        runUsage.unresolvedRequests++; this.sessionUsage.unresolvedRequests++;
         const body: Observation = { topology: this.config.topology, task: this.config.task, state: observation, time: observedAt, force: this.config.force, representation: this.config.representation, architecture: this.config.architecture, history: this.memory() };
         const response = await fetch('/api/jev', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal });
         const data = await response.json();
+        const rawUsage = data && typeof data === 'object' && 'usage' in data ? data.usage : undefined;
+        const receipt = validUsage(rawUsage) ? rawUsage : response.ok && validJevAnswer(data) ? usageFromDecisions([data]) : !response.ok && [400, 403, 413, 503].includes(response.status) ? emptyUsage() : null;
+        if (receipt) {
+          runUsage.unresolvedRequests--; this.sessionUsage.unresolvedRequests--;
+          addUsage(runUsage, receipt); addUsage(this.sessionUsage, receipt);
+          this.notify(true);
+        }
         if (!response.ok) { const error = data && typeof data === 'object' && 'error' in data ? data.error : null; throw new Error(typeof error === 'string' ? error : 'Jev 요청이 실패했습니다.'); }
         if (!validJevAnswer(data)) throw new Error('유효하지 않은 제어 응답입니다.');
         answer = data; force = answer.action === 'RIGHT' ? this.config.force : -this.config.force; model = answer.model; phase = 'Jev Choice';
@@ -162,8 +176,8 @@ export class Experiment {
     this.state = this.state.map((v, i) => i < n ? v : v + delta[i - n]);
     this.events.push({ time: this.time, type: kind === 'cart' ? 'cart impulse +0.4 N s' : 'pole1 angular impulse +0.12 N m s' }); this.notify(true);
   }
-  export(): Recording { return { version: 1, createdAt: new Date().toISOString(), config: { ...this.config }, frames: this.frames, decisions: this.decisions, events: this.events }; }
-  load(recording: Recording) { this.reset(recording.config); this.replay = recording; this.frames = recording.frames; this.decisions = recording.decisions; this.events = recording.events; this.seek(0); }
+  export(): Recording { return { version: 1, createdAt: new Date().toISOString(), config: { ...this.config }, frames: this.frames, decisions: this.decisions, events: this.events, usage: { ...this.usage } }; }
+  load(recording: Recording) { this.reset(recording.config); this.replay = recording; this.frames = recording.frames; this.decisions = recording.decisions; this.events = recording.events; this.usage = { ...(recording.usage ?? usageFromDecisions(recording.decisions)) }; this.seek(0); }
   seek(index: number, pause = true) {
     if (!this.replay) return; if (pause) this.pause();
     this.replayIndex = Math.max(0, Math.min(Math.floor(index), this.replay.frames.length - 1));
@@ -185,5 +199,6 @@ export function parseRecording(text: string): Recording {
   if (r.decisions.some(d => d.layers && !validJevAnswer({ ...d, action: d.action, calls: d.calls, nodeCount: d.nodeCount }))) throw new Error('유효하지 않은 네트워크 판단입니다.');
   if (r.decisions.some(d => d.local && (!Array.isArray(d.local.reference) || d.local.reference.length !== n || !d.local.reference.every(Number.isFinite) || ![d.local.force, d.local.feedforward, d.local.feedback].every(Number.isFinite) || typeof d.local.saturated !== 'boolean' || typeof d.local.phase !== 'string'))) throw new Error('유효하지 않은 로컬 제어 기록입니다.');
   if (!Array.isArray(r.events)) r.events = [];
+  if (r.usage !== undefined && !validUsage(r.usage)) throw new Error('유효하지 않은 사용량 기록입니다.');
   return r;
 }
