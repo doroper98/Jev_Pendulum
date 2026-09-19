@@ -5,7 +5,7 @@ import { addUsage, emptyUsage, usageFromDecisions, validUsage, type UsageTotals 
 
 export type Controller = 'jev' | 'local' | 'manual' | 'random';
 export interface Config { topology: Topology; task: Task; controller: Controller; architecture: Architecture; clock: 'wait' | 'realtime'; force: number; delay: number; duration: number; seed: number; representation: 'numeric' | 'described'; }
-export const DEFAULT_CONFIG: Config = { topology: 'single', task: 'swingup', controller: 'jev', architecture: 'single', clock: 'wait', force: 10, delay: 0, duration: 30, seed: 42, representation: 'numeric' };
+export const DEFAULT_CONFIG: Config = { topology: 'single', task: 'swingup', controller: 'jev', architecture: 'single', clock: 'realtime', force: 10, delay: 0, duration: 30, seed: 42, representation: 'numeric' };
 export interface Decision { id: number; observedAt: number; appliedAt: number; observation: State; force: number; action: string; model: string; latency: number; phase: string; local?: LocalControl; probabilities?: { LEFT: number; RIGHT: number }; confidence?: number; serverLatencyMs?: number; layers?: LayerDecision[]; calls?: number; nodeCount?: number; inputTokens?: number | null; outputTokens?: number | null; }
 export interface Frame { time: number; state: State; force: number; balance: number; wall: number; controlForce?: number; disturbanceForce?: number; }
 export interface Recording { version: 1; createdAt: string; config: Config; frames: Frame[]; decisions: Decision[]; events: { time: number; type: string }[]; usage?: UsageTotals; }

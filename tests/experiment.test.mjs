@@ -13,7 +13,7 @@ test('default experiment belongs to Jev and starts hanging down', () => {
   const e = new Experiment(); assert.equal(e.config.controller, 'jev'); assert.equal(e.config.task, 'swingup'); assert.ok(e.state[1] > 3); e.dispose();
 });
 test('wait clock freezes while Jev pending, then applies exactly chosen force for 20 ms', async () => {
-  const e = new Experiment(); let resolve;
+  const e = new Experiment({ ...DEFAULT_CONFIG, clock: 'wait' }); let resolve;
   globalThis.fetch = () => new Promise(r => { resolve = r; });
   const before = [...e.state], pending = e.singleStep(); await sleep(20);
   assert.equal(e.time, 0); assert.deepEqual(e.state, before);
@@ -36,6 +36,17 @@ test('realtime clock keeps previous force while a network response is pending', 
   assert.ok(e.time >= .04); assert.equal(e.force, 10); assert.notDeepEqual(e.state, before);
   resolve(Response.json(providerAnswer)); await sleep(0);
   assert.equal(e.force, -10); assert.ok(e.decisions[0].appliedAt >= .04); e.dispose();
+});
+
+test('default Jev clock advances at 1x throughout a two-second API wait', async () => {
+  const e = new Experiment(); let resolve;
+  globalThis.fetch = () => new Promise(r => { resolve = r; });
+  assert.equal(e.config.clock, 'realtime'); await e.start();
+  for (let i = 0; i < 50; i++) e.tick(e.lastFrame + 40);
+  assert.equal(e.pending, true); assert.equal(e.time, 2); assert.ok(Math.abs(e.wall - 2) < 1e-9);
+  assert.equal(e.force, 0); assert.equal(e.decisions.length, 0);
+  resolve(Response.json(providerAnswer)); await sleep(0);
+  assert.equal(e.force, -10); assert.equal(e.decisions[0].appliedAt, 2); e.dispose();
 });
 test('provider error pauses and does not use another controller', async () => {
   const e = new Experiment(); globalThis.fetch = async () => Response.json({ error: 'quota' }, { status: 429 });
